@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use crate::models::{
     AckRequest, AckResponse, BroadcastState, BroadcastStatus, ControlAction,
-    LiveScript, PushMode, SegmentPushMessage, StatePushMessage,
+    ControlRequest, LiveScript, PushMode, SegmentPushMessage, StatePushMessage,
 };
 
 #[derive(Clone)]
@@ -71,6 +71,8 @@ impl Broadcaster {
             last_acked_at: None,
             push_mode,
             pending_ack_count: 0,
+            interrupt_reason: None,
+            replay_count: 0,
         };
         inner.max_pending_ack = max_pending_ack;
         inner.ack_timeout_ms = ack_timeout_ms;
@@ -189,14 +191,18 @@ impl Broadcaster {
         }
     }
 
-    pub async fn control(&self, action: ControlAction) -> Result<BroadcastState, String> {
-        let result = match action {
+    pub async fn control(&self, req: ControlRequest) -> Result<BroadcastState, String> {
+        let result = match req.action {
             ControlAction::Start => self.start().await,
-            ControlAction::Pause => self.pause().await,
+            ControlAction::Pause => self.pause(None).await,
+            ControlAction::InterruptPause => self.pause(req.reason.clone()).await,
             ControlAction::Resume => self.resume().await,
             ControlAction::Stop => self.stop().await,
             ControlAction::Next => self.next_segment().await,
             ControlAction::Prev => self.prev_segment().await,
+            ControlAction::Replay => self.replay().await,
+            ControlAction::JumpTo => self.jump_to(req.target_index).await,
+            ControlAction::BackN => self.back_n(req.back_count.unwrap_or(1)).await,
         };
 
         if result.is_ok() {
@@ -225,23 +231,40 @@ impl Broadcaster {
         Ok(self.get_state().await)
     }
 
-    async fn pause(&self) -> Result<BroadcastState, String> {
+    async fn pause(&self, reason: Option<String>) -> Result<BroadcastState, String> {
         let mut inner = self.inner.write().await;
-        if matches!(inner.state.status, BroadcastStatus::Running) {
-            inner.state.status = BroadcastStatus::Paused;
-            inner.should_pause = true;
-            info!("播报已暂停");
+        if !matches!(inner.state.status, BroadcastStatus::Running) {
+            return Err("当前状态不支持暂停".to_string());
         }
+
+        inner.state.status = BroadcastStatus::Paused;
+        inner.should_pause = true;
+
+        if reason.is_some() {
+            inner.state.pending_ack_count = 0;
+            inner.state.interrupt_reason = reason.clone();
+            inner.retry_count = 0;
+            info!(
+                "播报已中断暂停，清除 pending_ack: {}",
+                reason.as_deref().unwrap_or("")
+            );
+        } else {
+            info!("播报已暂停（保留 pending_ack）");
+        }
+
         Ok(inner.state.clone())
     }
 
     async fn resume(&self) -> Result<BroadcastState, String> {
         let mut inner = self.inner.write().await;
-        if matches!(inner.state.status, BroadcastStatus::Paused) {
-            inner.state.status = BroadcastStatus::Running;
-            inner.should_pause = false;
-            info!("播报已恢复");
+        if !matches!(inner.state.status, BroadcastStatus::Paused) {
+            return Err("当前状态不支持恢复".to_string());
         }
+
+        inner.state.status = BroadcastStatus::Running;
+        inner.should_pause = false;
+        inner.state.interrupt_reason = None;
+        info!("播报已恢复");
         Ok(inner.state.clone())
     }
 
@@ -259,6 +282,8 @@ impl Broadcaster {
         inner.state.last_pushed_sequence = 0;
         inner.state.last_acked_sequence = None;
         inner.state.pending_ack_count = 0;
+        inner.state.interrupt_reason = None;
+        inner.state.replay_count = 0;
         inner.last_push_message = None;
         inner.retry_count = 0;
         info!("播报已停止");
@@ -299,8 +324,143 @@ impl Broadcaster {
         inner.state.current_segment = Some(segment.clone());
         inner.state.segments_broadcasted = prev_idx + 1;
 
-        info!("跳转到第 {} 段: {}", prev_idx + 1, truncate(&segment.text, 50));
+        self.push_segment_internal(&mut inner, prev_idx);
+
+        info!("回退到第 {} 段: {}", prev_idx + 1, truncate(&segment.text, 50));
         Ok(inner.state.clone())
+    }
+
+    async fn replay(&self) -> Result<BroadcastState, String> {
+        let mut inner = self.inner.write().await;
+        let script = inner.script.clone().ok_or("未加载台词脚本")?;
+
+        let current_idx = inner
+            .state
+            .current_segment_index
+            .ok_or("当前没有正在播报的段落")?;
+
+        if current_idx >= script.segments.len() {
+            return Err("段落索引越界".to_string());
+        }
+
+        inner.state.pending_ack_count = 0;
+        inner.state.replay_count += 1;
+        inner.retry_count = 0;
+
+        self.push_segment_internal(&mut inner, current_idx);
+
+        let segment = script.segments[current_idx].clone();
+        info!(
+            "重播第 {} 段 (第 {} 次重播): {}",
+            current_idx + 1,
+            inner.state.replay_count,
+            truncate(&segment.text, 50)
+        );
+        Ok(inner.state.clone())
+    }
+
+    async fn jump_to(&self, target_index: Option<usize>) -> Result<BroadcastState, String> {
+        let target = target_index.ok_or("跳转需要指定 target_index")?;
+        let mut inner = self.inner.write().await;
+        let script = inner.script.clone().ok_or("未加载台词脚本")?;
+
+        if target >= script.segments.len() {
+            return Err(format!(
+                "目标段落索引 {} 越界，共 {} 段",
+                target,
+                script.segments.len()
+            ));
+        }
+
+        inner.state.pending_ack_count = 0;
+        inner.state.replay_count = 0;
+        inner.retry_count = 0;
+
+        self.push_segment_internal(&mut inner, target);
+
+        let segment = script.segments[target].clone();
+        inner.state.segments_broadcasted = target + 1;
+
+        info!(
+            "跳转到第 {} 段: {}",
+            target + 1,
+            truncate(&segment.text, 50)
+        );
+        Ok(inner.state.clone())
+    }
+
+    async fn back_n(&self, n: usize) -> Result<BroadcastState, String> {
+        if n == 0 {
+            return Err("回退数量必须大于 0".to_string());
+        }
+
+        let mut inner = self.inner.write().await;
+        let script = inner.script.clone().ok_or("未加载台词脚本")?;
+
+        let current_idx = inner
+            .state
+            .current_segment_index
+            .ok_or("当前没有正在播报的段落")?;
+
+        if current_idx < n {
+            return Err(format!(
+                "无法回退 {} 段，当前在第 {} 段",
+                n,
+                current_idx + 1
+            ));
+        }
+
+        let target_idx = current_idx - n;
+
+        inner.state.pending_ack_count = 0;
+        inner.state.replay_count = 0;
+        inner.retry_count = 0;
+
+        self.push_segment_internal(&mut inner, target_idx);
+
+        let segment = script.segments[target_idx].clone();
+        inner.state.segments_broadcasted = target_idx + 1;
+
+        info!(
+            "回退 {} 段，从第 {} 段到第 {} 段: {}",
+            n,
+            current_idx + 1,
+            target_idx + 1,
+            truncate(&segment.text, 50)
+        );
+        Ok(inner.state.clone())
+    }
+
+    fn push_segment_internal(
+        &self,
+        inner: &mut BroadcasterInner,
+        segment_index: usize,
+    ) {
+        if let Some(script) = &inner.script {
+            if segment_index >= script.segments.len() {
+                return;
+            }
+
+            let segment = &script.segments[segment_index];
+            inner.state.last_pushed_sequence += 1;
+
+            let push_msg = SegmentPushMessage {
+                sequence: inner.state.last_pushed_sequence,
+                segment_index,
+                segment_id: segment.id,
+                text: segment.text.clone(),
+                duration_ms: segment.duration_ms,
+                segments_total: script.segments.len(),
+                push_timestamp: Utc::now(),
+                is_retry: false,
+            };
+
+            inner.state.current_segment_index = Some(segment_index);
+            inner.state.current_segment = Some(segment.clone());
+            inner.state.last_pushed_at = Some(Utc::now());
+            inner.state.pending_ack_count = inner.state.pending_ack_count.saturating_add(1);
+            inner.last_push_message = Some(push_msg);
+        }
     }
 
     async fn run_broadcast(&self) {
@@ -388,10 +548,9 @@ impl Broadcaster {
         {
             let mut inner = self.inner.write().await;
             inner.state.last_pushed_sequence += 1;
-            let seq = inner.state.last_pushed_sequence;
 
             let push_msg = SegmentPushMessage {
-                sequence: seq,
+                sequence: inner.state.last_pushed_sequence,
                 segment_index: next_idx,
                 segment_id: segment.id,
                 text: segment.text.clone(),
@@ -478,10 +637,9 @@ impl Broadcaster {
         {
             let mut inner = self.inner.write().await;
             inner.state.last_pushed_sequence += 1;
-            let seq = inner.state.last_pushed_sequence;
 
             let push_msg = SegmentPushMessage {
-                sequence: seq,
+                sequence: inner.state.last_pushed_sequence,
                 segment_index: next_idx,
                 segment_id: segment.id,
                 text: segment.text.clone(),
@@ -594,7 +752,7 @@ impl Broadcaster {
 
             {
                 let inner = self.inner.read().await;
-                if inner.should_stop {
+                if inner.should_stop || inner.should_pause {
                     return;
                 }
             }

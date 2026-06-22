@@ -76,8 +76,11 @@ pub async fn control_broadcast(
     State(broadcaster): State<Broadcaster>,
     Json(req): Json<ControlRequest>,
 ) -> Result<Json<BroadcastState>, AppError> {
-    info!("控制播报: action={:?}", req.action);
-    let state = broadcaster.control(req.action).await?;
+    info!(
+        "控制播报: action={:?}, target_index={:?}, back_count={:?}, reason={:?}",
+        req.action, req.target_index, req.back_count, req.reason
+    );
+    let state = broadcaster.control(req).await?;
     Ok(Json(state))
 }
 
@@ -121,6 +124,8 @@ pub async fn broadcast_sse(
             "segments_acked": state_msg.segments_acked,
             "segments_broadcasted": state_msg.segments_broadcasted,
             "push_timestamp": state_msg.push_timestamp,
+            "interrupt_reason": initial_state.interrupt_reason,
+            "replay_count": initial_state.replay_count,
         });
         yield Ok(Event::default().data(state_data.to_string()));
 
@@ -173,6 +178,8 @@ pub async fn broadcast_sse(
                             "push_timestamp": state_msg.push_timestamp,
                             "pending_ack_count": state.pending_ack_count,
                             "push_mode": state.push_mode,
+                            "interrupt_reason": state.interrupt_reason,
+                            "replay_count": state.replay_count,
                         });
                         yield Ok(Event::default().data(state_data.to_string()));
                     }

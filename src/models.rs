@@ -84,6 +84,8 @@ pub struct BroadcastState {
     pub last_acked_at: Option<DateTime<Utc>>,
     pub push_mode: PushMode,
     pub pending_ack_count: usize,
+    pub interrupt_reason: Option<String>,
+    pub replay_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +119,8 @@ impl Default for BroadcastState {
             last_acked_at: None,
             push_mode: PushMode::default(),
             pending_ack_count: 0,
+            interrupt_reason: None,
+            replay_count: 0,
         }
     }
 }
@@ -176,17 +180,27 @@ pub struct CurrentBroadcastResponse {
 #[derive(Debug, Deserialize)]
 pub struct ControlRequest {
     pub action: ControlAction,
+    #[serde(default)]
+    pub target_index: Option<usize>,
+    #[serde(default)]
+    pub back_count: Option<usize>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlAction {
     Start,
     Pause,
+    InterruptPause,
     Resume,
     Stop,
     Next,
     Prev,
+    BackN,
+    Replay,
+    JumpTo,
 }
 
 #[derive(Debug, Serialize)]
