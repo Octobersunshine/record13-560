@@ -38,6 +38,7 @@ async fn main() {
         .route("/api/script", post(upload_script))
         .route("/api/broadcast/state", get(get_broadcast_state))
         .route("/api/broadcast/control", post(control_broadcast))
+        .route("/api/broadcast/ack", post(acknowledge_segment))
         .route("/api/broadcast/stream", get(broadcast_sse))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
